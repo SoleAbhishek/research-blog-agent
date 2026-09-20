@@ -8,9 +8,26 @@ from typing import TypedDict, List, Annotated, Literal, Optional
 import operator
 from pathlib import Path
 from dotenv import load_dotenv
+from google import genai
+from concurrent.futures import ThreadPoolExecutor
 
 
 load_dotenv()
+
+class ImagePlacement(BaseModel):
+    id: str = Field(description="Unique short id like 'hero', 'diagram_1', 'concept_2'")
+    target_heading: str = Field(description="The section heading (or 'top' for hero cover image) where this image belongs")
+    placement: Literal['top', 'after_heading', 'end_of_section'] = Field(
+        default='after_heading',
+        description="Position relative to target_heading: 'top' for below the main blog title, 'after_heading' for immediately after heading, or 'end_of_section'"
+    )
+    prompt: str = Field(description="Detailed visual prompt describing scene, visual metaphors, composition, colors, lighting, art style. Explicitly avoid text/words.")
+    alt_text: str = Field(description="Descriptive alt text for accessibility")
+    caption: str = Field(description="Insightful 1-sentence caption explaining what this image illustrates")
+
+class VisualPlan(BaseModel):
+    art_style: str = Field(description="Unified art direction across all images (e.g. 'Modern minimalist tech vector illustration, clean lines, subtle glowing accents')")
+    images: List[ImagePlacement] = Field(min_length=1, max_length=3, description="1 to 3 planned images: 1 hero image plus 1-2 key conceptual diagrams or illustrations")
 
 class Task(BaseModel):
     id: str
@@ -57,6 +74,8 @@ class State(TypedDict):
     evidence: List[EvidenceItem]
     plan: Plan
     sections: Annotated[List[tuple[int, str]], operator.add]
+    merged_content: Optional[str]
+    visual_plan: Optional[VisualPlan]
     final_blog: str
 
 llm = ChatGoogleGenerativeAI(model='gemini-3.1-flash-lite')
@@ -265,6 +284,7 @@ def fanout(state: State):
     return [Send(
         'worker',
         {
+            'index': idx,
             'task': task,
             'topic': state['topic'],
             'plan': state['plan'],
@@ -272,10 +292,11 @@ def fanout(state: State):
             'evidence': state.get('evidence', []),
         }
     )
-    for task in state['plan'].tasks
+    for idx, task in enumerate(state['plan'].tasks)
     ]
 
 def worker(payload: dict):
+    idx = payload.get('index', 0)
     response = llm.invoke([
         SystemMessage(content=(
             "You are a skilled blog writer. Write exactly one polished section of the "
@@ -328,37 +349,182 @@ def worker(payload: dict):
         )
     res = str(content).strip()
 
-    return {'sections': [res]}
+    return {'sections': [(idx, res)]}
 
-def reducer(state: State):
-    """Combine generated sections, save the completed blog, and return it."""
+def assemble_sections(state: State):
+    """Sort worker sections by task index and merge them into an initial markdown draft."""
     plan = state['plan']
     blog_title = plan.blog_title
-    final_blog = f"# {blog_title}\n\n" + "\n\n".join(state['sections']) + "\n"
+    raw_sections = state.get('sections', [])
+
+    if raw_sections and isinstance(raw_sections[0], (list, tuple)):
+        sorted_sections = [text for _, text in sorted(raw_sections, key=lambda x: x[0])]
+    else:
+        sorted_sections = [str(s) for s in raw_sections]
+
+    merged_content = f"# {blog_title}\n\n" + "\n\n".join(sorted_sections) + "\n"
+    return {'merged_content': merged_content}
+
+VISUAL_DIRECTOR_SYSTEM_PROMPT = """
+You are an expert Art Director and Visual Editor for high-profile technical and explainer blogs.
+Your job is to review the complete assembled blog post and plan a cohesive set of 1 to 3 high-impact images.
+
+Rules:
+- High quality and editorial balance: Plan 1 to 3 images total.
+- Always include 1 Hero image placed at the top (target_heading='top') that visually encapsulates the blog theme.
+- Plan 1-2 additional images for the most complex, conceptual, or technical sections where a visual diagram or illustration clarifies the explanation.
+- Do NOT plan images for conclusions, short summaries, or basic checklists.
+- Maintain a single, consistent art_style across all images (e.g., 'Clean modern vector illustration with isometric perspective and soft gradient lighting').
+- For each image prompt:
+  * Clearly describe the subject, scene, layout, colors, and lighting.
+  * Incorporate the shared art_style.
+  * Explicitly mandate: "No text, no letters, no typography, no words, no watermark in the image".
+- Provide an informative alt_text and a reader-friendly caption.
+"""
+
+def plan_visuals(state: State):
+    """Evaluate the entire blog draft with an LLM and produce a unified visual plan."""
+    merged = state.get('merged_content', '')
+    plan = state['plan']
+
+    director_llm = llm.with_structured_output(VisualPlan)
+    visual_plan = director_llm.invoke([
+        SystemMessage(content=VISUAL_DIRECTOR_SYSTEM_PROMPT),
+        HumanMessage(content=(
+            f"Blog Title: {plan.blog_title}\n"
+            f"Topic: {state['topic']}\n"
+            f"Audience: {plan.audience}\n"
+            f"Tone: {plan.tone}\n\n"
+            f"Complete Blog Draft:\n{merged}\n\n"
+            "Create the visual plan for this blog post."
+        ))
+    ])
+    return {'visual_plan': visual_plan}
+
+def _generate_single_image(placement: ImagePlacement, art_style: str, slug: str, output_dir: Path) -> Optional[dict]:
+    output_path = output_dir / f"{slug}_{placement.id}.png"
+    try:
+        client = genai.Client()
+        full_prompt = (
+            f"{placement.prompt}. Art style: {art_style}. "
+            "High resolution, professional illustration, no text, no words, no letters, no watermark."
+        )
+        resp = client.models.generate_content(
+            model='gemini-2.5-flash-image',
+            contents=full_prompt,
+        )
+        for part in resp.candidates[0].content.parts:
+            if getattr(part, 'inline_data', None):
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(part.inline_data.data)
+                return {
+                    'placement': placement,
+                    'path': output_path.as_posix(),
+                }
+    except Exception as e:
+        print(f"Warning: Failed to generate image '{placement.id}': {e}")
+    return None
+
+def _insert_image_into_markdown(content: str, placement: ImagePlacement, img_path: str) -> str:
+    lines = content.splitlines()
+    inserted = False
+    new_lines = []
+    img_markdown = f"![{placement.alt_text}]({img_path})\n*{placement.caption}*"
+
+    if placement.placement == 'top' or placement.target_heading.lower() in ('top', 'hero'):
+        for line in lines:
+            new_lines.append(line)
+            if line.startswith('# ') and not inserted:
+                new_lines.append('')
+                new_lines.append(img_markdown)
+                inserted = True
+        if not inserted:
+            new_lines.insert(0, img_markdown)
+        return '\n'.join(new_lines)
+
+    target_norm = placement.target_heading.lstrip('#').strip().lower()
+    for line in lines:
+        new_lines.append(line)
+        line_norm = line.lstrip('#').strip().lower()
+        if line.startswith('#') and (target_norm in line_norm or line_norm in target_norm) and not inserted:
+            new_lines.append('')
+            new_lines.append(img_markdown)
+            inserted = True
+
+    if not inserted:
+        new_lines.append('')
+        new_lines.append(img_markdown)
+
+    return '\n'.join(new_lines)
+
+def generate_and_insert_images(state: State):
+    """Generate planned images concurrently, inject them into the markdown draft, and save the file."""
+    plan = state['plan']
+    blog_title = plan.blog_title
+    merged_content = state.get('merged_content', '')
+    visual_plan: Optional[VisualPlan] = state.get('visual_plan')
 
     filename = ''.join(
         char if char.isalnum() or char in (' ', '-', '_') else '_'
         for char in blog_title
     ).strip().replace(' ', '_') or 'final_blog'
-    Path(f'{filename}.md').write_text(final_blog, encoding='utf-8')
 
+    final_blog = merged_content
+    images_dir = Path('images')
+
+    if visual_plan and visual_plan.images:
+        print(f"Generating {len(visual_plan.images)} images concurrently...")
+        with ThreadPoolExecutor(max_workers=min(len(visual_plan.images), 3)) as executor:
+            futures = [
+                executor.submit(_generate_single_image, img, visual_plan.art_style, filename, images_dir)
+                for img in visual_plan.images
+            ]
+            results = [f.result() for f in futures]
+
+        for res in results:
+            if res:
+                final_blog = _insert_image_into_markdown(
+                    final_blog,
+                    res['placement'],
+                    res['path']
+                )
+
+    Path(f'{filename}.md').write_text(final_blog, encoding='utf-8')
+    print(f"Final blog saved to {filename}.md with visual enhancements!")
     return {'final_blog': final_blog}
+
+def create_reducer_subgraph():
+    """Build the reducer subgraph: assemble sections -> plan visuals with LLM -> generate & insert images."""
+    subgraph = StateGraph(State)
+    subgraph.add_node('assemble_sections', assemble_sections)
+    subgraph.add_node('plan_visuals', plan_visuals)
+    subgraph.add_node('generate_and_insert_images', generate_and_insert_images)
+
+    subgraph.add_edge(START, 'assemble_sections')
+    subgraph.add_edge('assemble_sections', 'plan_visuals')
+    subgraph.add_edge('plan_visuals', 'generate_and_insert_images')
+    subgraph.add_edge('generate_and_insert_images', END)
+
+    return subgraph.compile()
+
+reducer_subgraph = create_reducer_subgraph()
 
 graph = StateGraph(State)
 graph.add_node('orchestrator', create_plan)
 graph.add_node('worker', worker)
-graph.add_node('reducer', reducer)
+graph.add_node('reducer', reducer_subgraph)
 graph.add_node('research', research_node)
 graph.add_node('router', router)
 
 graph.add_edge(START, 'router')
 graph.add_conditional_edges('router', route_next, ['research', 'orchestrator'])
-graph.add_edge('research','orchestrator')
+graph.add_edge('research', 'orchestrator')
 graph.add_conditional_edges('orchestrator', fanout, ['worker'])
 graph.add_edge('worker', 'reducer')
 graph.add_edge('reducer', END)
 
 app = graph.compile()
 
-app.invoke({'topic': 'Newest breakthroughs in AI research and their implications for the future of technology'})
+if __name__ == '__main__':
+    app.invoke({'topic': 'Newest breakthroughs in AI research and their implications for the future of technology'})
 
