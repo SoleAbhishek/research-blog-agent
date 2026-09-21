@@ -3,7 +3,7 @@ from langgraph.types import Send
 from langchain_core.messages import SystemMessage, HumanMessage
 from state import State
 from prompts import WORKER_SYSTEM_PROMPT
-from tools.evidence import filter_relevant_evidence
+from tools.evidence import filter_relevant_evidence, format_evidence_markdown
 from config import writer_llm
 
 def fanout(state: State) -> List[Send]:
@@ -39,6 +39,7 @@ def fanout(state: State) -> List[Send]:
 def worker(payload: dict) -> dict:
     """Write an individual section using Tier 2 Creative Specialist model."""
     idx = payload.get('index', 0)
+    formatted_evidence = format_evidence_markdown(payload.get('evidence', []), max_chars=250)
     response = writer_llm.invoke([
         SystemMessage(content=WORKER_SYSTEM_PROMPT),
         HumanMessage(content=(
@@ -54,7 +55,7 @@ def worker(payload: dict) -> dict:
             f"Target word count: {payload['task'].target_words}\n"
             f"Requires research: {payload['task'].requires_research}\n"
             f"Requires citations: {payload['task'].requires_citations}\n\n"
-            f"Available evidence:\n{payload.get('evidence', [])}\n\n"
+            f"Available evidence:\n{formatted_evidence}\n\n"
             "Write the section now."
         ))
     ])

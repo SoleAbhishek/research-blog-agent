@@ -14,7 +14,7 @@ class ImagePlacement(BaseModel):
 
 class VisualPlan(BaseModel):
     art_style: str = Field(description="Unified art direction across all images (e.g. 'Modern minimalist tech vector illustration, clean lines, subtle glowing accents')")
-    images: List[ImagePlacement] = Field(min_length=1, max_length=3, description="1 to 3 planned images: 1 hero image plus 1-2 key conceptual diagrams or illustrations")
+    images: List[ImagePlacement] = Field(min_length=1, max_length=2, description="1 to 2 high-impact images: 1 hero cover image plus at most 1 key conceptual diagram or illustration")
 
 class Task(BaseModel):
     id: str

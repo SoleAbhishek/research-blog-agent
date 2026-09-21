@@ -31,3 +31,16 @@ def filter_relevant_evidence(
     # Return top matches with a positive score; fallback to top_k general evidence if no direct keywords matched
     matched = [item for score, item in scored_evidence if score > 0]
     return matched[:top_k] if matched else evidence[:top_k]
+
+def format_evidence_markdown(evidence: List[EvidenceItem], max_chars: int = 250) -> str:
+    """Format evidence items into a compact, token-efficient Markdown list with clipped snippets."""
+    if not evidence:
+        return "No external research required for this section."
+
+    lines = []
+    for e in evidence:
+        snippet = (e.snippet or "").strip().replace("\n", " ")
+        if len(snippet) > max_chars:
+            snippet = snippet[:max_chars].rsplit(" ", 1)[0] + "..."
+        lines.append(f"- [{e.title}]({e.url}): {snippet}")
+    return "\n".join(lines)

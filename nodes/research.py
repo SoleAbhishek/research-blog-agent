@@ -9,8 +9,8 @@ from config import fast_llm
 
 def research_node(state: State) -> dict:
     """Execute concurrent web searches and synthesize raw results into deduplicated EvidenceItems."""
-    queries = state.get("queries", []) or []
-    max_results = 6
+    queries = (state.get("queries", []) or [])[:5]
+    max_results = 5
 
     if not queries:
         return {"evidence": []}
@@ -31,11 +31,23 @@ def research_node(state: State) -> dict:
     if not raw_results:
         return {"evidence": []}
 
+    # Compact snippet size to avoid token inflation in research synthesizer
+    compact_results = [
+        {
+            'title': r.get('title', ''),
+            'url': r.get('url', ''),
+            'snippet': (r.get('snippet', '') or '')[:300],
+            'published_at': r.get('published_at'),
+            'source': r.get('source')
+        }
+        for r in raw_results
+    ]
+
     extractor = fast_llm.with_structured_output(EvidencePack)
     pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM_PROMPT),
-            HumanMessage(content=f"Raw results:\n{raw_results}"),
+            HumanMessage(content=f"Raw results:\n{compact_results}"),
         ]
     )
 

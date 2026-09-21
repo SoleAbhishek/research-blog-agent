@@ -13,8 +13,8 @@ IMAGES_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
 
 # --- MODEL TIERING ---
-# Tier 1: The Architect (High reasoning for planning and structural breakdown)
-planner_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
+# Tier 1: The Architect (High reasoning for planning; thinking_budget capped to 1024 tokens for fast turnaround)
+planner_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2, thinking_budget=1024)
 
 # Tier 2: The Creative Specialist (Expressive, nuanced language modeling for section drafting)
 writer_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
