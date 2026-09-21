@@ -6,6 +6,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from typing import TypedDict, List, Annotated, Literal, Optional
 import operator
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
@@ -48,7 +49,7 @@ class Plan(BaseModel):
     audience: str = Field(description="Who is the blog for")
     tone: str = Field(description="Writing Tone(eg. Practical, Crisp)")
     blog_kind: Literal['Explainer', 'Tutorial', "news_roundup", 'comparison', 'system_design'] = 'Explainer'
-    constaints: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
 
 class EvidenceItem(BaseModel):
     title: str
@@ -78,7 +79,15 @@ class State(TypedDict):
     visual_plan: Optional[VisualPlan]
     final_blog: str
 
-llm = ChatGoogleGenerativeAI(model='gemini-3.1-flash-lite')
+# --- MODEL TIERING ---
+# Tier 1: The Architect (High reasoning capacity for structural planning, task breakdown, and schema adherence)
+planner_llm = ChatGoogleGenerativeAI(model='gemini-2.5-pro', temperature=0.2)
+
+# Tier 2: The Creative Specialist (Strong language modeling, expressive prose, and tone calibration for section writing)
+writer_llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash', temperature=0.7)
+
+# Tier 3: The Rapid Operator (Sub-second response, zero temperature for deterministic classification, extraction, and visual directing)
+fast_llm = ChatGoogleGenerativeAI(model='gemini-3.1-flash-lite', temperature=0.0)
 
 ROUTER_SYSTEM_PROMPT = """
 You are the research-routing agent for a blog-generation system. Your job is to decide whether the requested topic can be written from stable general knowledge or requires web research. Return only a response that fits the RouterDecision schema.
@@ -128,7 +137,7 @@ if needs_research=true:
 def router(state: State):
     topic = state['topic']
 
-    response = llm.with_structured_output(RouterDecision).invoke(
+    response = fast_llm.with_structured_output(RouterDecision).invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM_PROMPT),
             HumanMessage(content=f'Topic:{topic}')
@@ -196,20 +205,30 @@ Output requirements:
 """
 
 def research_node(state: State) -> dict:
-
-    # take the first 10 queries from state
     queries = (state.get("queries", []) or [])
     max_results = 6
 
+    if not queries:
+        return {"evidence": []}
+
+    print(f"Running {len(queries)} search queries concurrently via ThreadPoolExecutor...")
     raw_results: List[dict] = []
 
-    for q in queries:
-        raw_results.extend(tavily_search(q, max_results=max_results))
+    # Parallelize Tavily searches across all queries
+    with ThreadPoolExecutor(max_workers=min(len(queries), 5)) as executor:
+        futures = {executor.submit(tavily_search, q, max_results=max_results): q for q in queries}
+        for future in futures:
+            try:
+                res = future.result()
+                if res:
+                    raw_results.extend(res)
+            except Exception as e:
+                print(f"Warning: Tavily search failed for query '{futures[future]}': {e}")
 
     if not raw_results:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
+    extractor = fast_llm.with_structured_output(EvidencePack)
     pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM_PRMPT),
@@ -229,7 +248,7 @@ def create_plan(state: State):
 
     evidence = state.get('evidence', [])
     mode = state.get('mode', 'closed_book')
-    response = llm.with_structured_output(Plan).invoke([
+    response = planner_llm.with_structured_output(Plan).invoke([
         SystemMessage(content=(
             "You are an expert blog editor, information architect, and research planner. "
             "Create a clear, accurate, practical outline for a high-quality blog post. "
@@ -280,24 +299,64 @@ def create_plan(state: State):
 
     return {'plan': response}
 
+def filter_relevant_evidence(task: Task, evidence: List[EvidenceItem], top_k: int = 4) -> List[EvidenceItem]:
+    """Prune and rank evidence items so each worker receives only context relevant to its section."""
+    if not evidence or not task.requires_research:
+        return []
+
+    # Build search context from task metadata
+    task_context = f"{task.title} {task.goal} {' '.join(task.bullets)} {' '.join(task.tags)}".lower()
+    stop_words = {'the', 'and', 'for', 'with', 'that', 'this', 'from', 'have', 'what', 'how', 'are', 'was', 'your', 'about'}
+    task_keywords = {word for word in re.findall(r'\b[a-z0-9_-]{3,}\b', task_context) if word not in stop_words}
+
+    scored_evidence = []
+    for item in evidence:
+        title_lower = (item.title or '').lower()
+        snippet_lower = (item.snippet or '').lower()
+        # Weight matches in the title higher than in snippet body
+        score = sum(2 for kw in task_keywords if kw in title_lower)
+        score += sum(1 for kw in task_keywords if kw in snippet_lower)
+        scored_evidence.append((score, item))
+
+    # Sort descending by relevance score
+    scored_evidence.sort(key=lambda x: x[0], reverse=True)
+
+    # Return top matches with a positive score; fallback to top_k general evidence if no direct keywords matched
+    matched = [item for score, item in scored_evidence if score > 0]
+    return matched[:top_k] if matched else evidence[:top_k]
+
 def fanout(state: State):
-    return [Send(
-        'worker',
-        {
-            'index': idx,
-            'task': task,
-            'topic': state['topic'],
-            'plan': state['plan'],
-            'mode': state.get('mode', 'closed_book'),
-            'evidence': state.get('evidence', []),
-        }
-    )
-    for idx, task in enumerate(state['plan'].tasks)
-    ]
+    all_evidence = state.get('evidence', [])
+    mode = state.get('mode', 'closed_book')
+    tasks = state['plan'].tasks
+
+    payloads = []
+    for idx, task in enumerate(tasks):
+        # Context Pruning: Only send relevant evidence if section requires research
+        task_evidence = (
+            filter_relevant_evidence(task, all_evidence, top_k=4)
+            if mode != 'closed_book' and task.requires_research
+            else []
+        )
+
+        payloads.append(
+            Send(
+                'worker',
+                {
+                    'index': idx,
+                    'task': task,
+                    'topic': state['topic'],
+                    'plan': state['plan'],
+                    'mode': mode,
+                    'evidence': task_evidence,
+                }
+            )
+        )
+    return payloads
 
 def worker(payload: dict):
     idx = payload.get('index', 0)
-    response = llm.invoke([
+    response = writer_llm.invoke([
         SystemMessage(content=(
             "You are a skilled blog writer. Write exactly one polished section of the "
             "planned blog post using the supplied section brief and evidence. Match the "
@@ -387,7 +446,7 @@ def plan_visuals(state: State):
     merged = state.get('merged_content', '')
     plan = state['plan']
 
-    director_llm = llm.with_structured_output(VisualPlan)
+    director_llm = fast_llm.with_structured_output(VisualPlan)
     visual_plan = director_llm.invoke([
         SystemMessage(content=VISUAL_DIRECTOR_SYSTEM_PROMPT),
         HumanMessage(content=(
